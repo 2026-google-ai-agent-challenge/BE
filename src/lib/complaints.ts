@@ -19,11 +19,29 @@ export interface Complaint {
 /**
  * 0. 새로운 민원을 생성하고 사용자의 민원 목록에 추가하는 함수
  */
-export async function submitUserComplaint(userId: string, title: string, content: string, actual_department: string) {
-  // 민원 생성 (작성자 user_id 포함)
+export async function submitUserComplaint(
+  userId: string,
+  title: string,
+  content: string,
+  actual_department: string,
+  ai_department_1?: string | null,
+  ai_department_2?: string | null,
+  ai_department_3?: string | null,
+  ai_reason?: string | null
+) {
+  // 민원 생성 (작성자 user_id 포함 및 AI 추천 결과 포함)
   const { data: complaintData, error: complaintError } = await supabase
     .from('complaints')
-    .insert([{ title, content, actual_department, user_id: userId }])
+    .insert([{
+      title,
+      content,
+      actual_department,
+      user_id: userId,
+      ai_department_1,
+      ai_department_2,
+      ai_department_3,
+      ai_reason
+    }])
     .select()
     .single();
 

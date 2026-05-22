@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { searchSimilarComplaints } from '../../lib/searchSimilarComplaints';
 import { Complaint, submitUserComplaint } from '../../lib/complaints';
+import { RecommendationResult } from '../../lib/keywordRecommend';
 
 export default function RecommendPage() {
   const router = useRouter();
@@ -15,6 +16,11 @@ export default function RecommendPage() {
   const [selectedDept, setSelectedDept] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // AI 추천 관련 추가 상태들
+  const [aiRecommendations, setAiRecommendations] = useState<RecommendationResult[]>([]);
+  const [isAIRecommendLoading, setIsAIRecommendLoading] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
 
   useEffect(() => {
     const data = localStorage.getItem('currentUser');
@@ -98,33 +104,60 @@ export default function RecommendPage() {
     }
 
     setIsLoading(true);
+    setIsAIRecommendLoading(true);
     setError(null);
+    setAiError(null);
 
     // 1. 키워드 추출
     const extracted = extractKeywords(content);
     setKeywords(extracted);
 
+    // 2. 기존 유사 민원 검색 수행 (DB)
     try {
-      // 2. 키워드가 없는 경우 빈 결과 반환
       if (extracted.length === 0) {
         setResults([]);
-        setIsLoading(false);
-        return;
+      } else {
+        const searchResults = await searchSimilarComplaints(extracted);
+        setResults(searchResults);
+        
+        if (searchResults.length > 0) {
+          setSelectedDept(searchResults[0].actual_department);
+        }
       }
-
-      // 3. 유사 민원 검색 함수 실행
-      const searchResults = await searchSimilarComplaints(extracted);
-      setResults(searchResults);
-      
-      if (searchResults.length > 0) {
-        setSelectedDept(searchResults[0].actual_department);
-      }
-
     } catch (err: any) {
-      console.error(err);
+      console.error("유사 민원 검색 에러:", err);
       setError(err.message || '데이터베이스 조회 중 오류가 발생했습니다.');
     } finally {
       setIsLoading(false);
+    }
+
+    // 3. Google Gemini API 기반 AI 추천 비동기 호출
+    try {
+      const aiRes = await fetch('/api/recommend', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ title, content }),
+      });
+
+      if (!aiRes.ok) {
+        throw new Error(`AI 서버 응답 오류 (상태: ${aiRes.status})`);
+      }
+
+      const aiData = await aiRes.json();
+      if (aiData.recommendations && aiData.recommendations.length > 0) {
+        setAiRecommendations(aiData.recommendations);
+        // AI 추천 1순위 부서가 있으면 자동으로 선택부서 지정
+        setSelectedDept(aiData.recommendations[0].department);
+      } else {
+        throw new Error('올바른 추천 결과를 반환받지 못했습니다.');
+      }
+    } catch (err: any) {
+      console.error("AI 담당 부서 추천 에러:", err);
+      setAiError(err.message || 'AI 담당 부서 추천 과정에서 예상치 못한 오류가 발생했습니다.');
+    } finally {
+      setIsAIRecommendLoading(false);
     }
   };
 
@@ -142,13 +175,59 @@ export default function RecommendPage() {
     const recommendedDept = selectedDept || (results.length > 0 ? results[0].actual_department : '미배정');
     setIsLoading(true);
     try {
-      await submitUserComplaint(currentUser.id, title, content, recommendedDept);
+      let currentRecommendations = aiRecommendations;
+
+      // 만약 AI 추천이 아직 수행되지 않았다면 (aiRecommendations가 비어있다면) 자동으로 추천을 받아옴
+      if (currentRecommendations.length === 0) {
+        try {
+          const aiRes = await fetch('/api/recommend', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ title, content }),
+          });
+
+          if (aiRes.ok) {
+            const aiData = await aiRes.json();
+            if (aiData.recommendations && aiData.recommendations.length > 0) {
+              currentRecommendations = aiData.recommendations;
+              setAiRecommendations(aiData.recommendations);
+            }
+          }
+        } catch (err) {
+          console.error("민원 등록 시 실시간 AI 추천 자동 로딩 실패:", err);
+        }
+      }
+
+      // AI 추천 데이터 매핑
+      const ai_dept_1 = currentRecommendations[0]?.department || null;
+      const ai_dept_2 = currentRecommendations[1]?.department || null;
+      const ai_dept_3 = currentRecommendations[2]?.department || null;
+
+      // 사용자가 선택한 부서의 AI 추천 사유를 매핑하고, 없으면 1순위 추천 부서의 사유를 기본값으로 사용
+      const matchedRec = currentRecommendations.find(rec => rec.department === recommendedDept);
+      const ai_reason = matchedRec?.reason || currentRecommendations[0]?.reason || null;
+
+      await submitUserComplaint(
+        currentUser.id,
+        title,
+        content,
+        recommendedDept,
+        ai_dept_1,
+        ai_dept_2,
+        ai_dept_3,
+        ai_reason
+      );
+
       alert('민원이 성공적으로 등록되었습니다.');
       // 폼 초기화 (선택 사항)
       setTitle('');
       setContent('');
       setResults([]);
       setKeywords([]);
+      setAiRecommendations([]);
+      setSelectedDept('');
     } catch (err: any) {
       console.error(err);
       alert(err.message || '민원 등록 중 오류가 발생했습니다.');
@@ -488,6 +567,240 @@ export default function RecommendPage() {
             flexDirection: 'column',
             gap: '1.5rem'
           }}>
+            
+            {/* 🤖 AI 실시간 담당 부서 추천 결과 카드 */}
+            <div style={{
+              backgroundColor: '#ffffff',
+              borderRadius: '16px',
+              padding: '2rem',
+              boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.05), 0 4px 6px -2px rgba(0, 0, 0, 0.05)',
+              border: '1px solid #e2e8f0',
+              position: 'relative',
+              overflow: 'hidden'
+            }}>
+              {/* 프리미엄 인공지능 느낌의 상단 빛나는 그라데이션 라인 */}
+              <div style={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                right: 0,
+                height: '4px',
+                background: 'linear-gradient(90deg, #6366f1, #3b82f6, #ec4899)'
+              }} />
+
+              <div style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                marginBottom: '1.5rem',
+                borderBottom: '1px solid #f1f5f9',
+                paddingBottom: '0.8rem'
+              }}>
+                <h2 style={{
+                  fontSize: '1.3rem',
+                  fontWeight: 800,
+                  color: '#1e293b',
+                  margin: 0,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem'
+                }}>
+                  <span style={{ fontSize: '1.5rem' }}>🤖</span> AI 실시간 담당 부서 추천
+                </h2>
+                <span style={{
+                  fontSize: '0.75rem',
+                  color: '#6366f1',
+                  backgroundColor: '#e0e7ff',
+                  padding: '0.25rem 0.6rem',
+                  borderRadius: '20px',
+                  fontWeight: 700,
+                  letterSpacing: '0.05em'
+                }}>
+                  GEMINI AI
+                </span>
+              </div>
+
+              {aiError && (
+                <div style={{
+                  backgroundColor: '#fef2f2',
+                  color: '#991b1b',
+                  padding: '1rem',
+                  borderRadius: '8px',
+                  border: '1px solid #fca5a5',
+                  fontSize: '0.9rem',
+                  marginBottom: '1rem'
+                }}>
+                  ⚠️ AI 추천 과정에서 문제가 발생하여 로컬 키워드 분석 결과로 우아하게 대체되었습니다: {aiError}
+                </div>
+              )}
+
+              {isAIRecommendLoading ? (
+                <div style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  padding: '3.5rem 1rem',
+                  color: '#64748b',
+                  gap: '1rem'
+                }}>
+                  <div style={{
+                    width: '40px',
+                    height: '40px',
+                    border: '4px solid #e2e8f0',
+                    borderTop: '4px solid #6366f1',
+                    borderRadius: '50%',
+                    animation: 'spin 1s linear infinite'
+                  }} />
+                  <p style={{ margin: 0, fontWeight: 600, fontSize: '0.95rem', color: '#4f46e5' }}>
+                    Gemini AI가 민원 내용을 심층 분석 중입니다...
+                  </p>
+                </div>
+              ) : aiRecommendations.length === 0 ? (
+                <div style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: '#94a3b8',
+                  padding: '3rem 1rem',
+                  textAlign: 'center'
+                }}>
+                  <div style={{ fontSize: '3rem', marginBottom: '1rem', filter: 'grayscale(10%)' }}>💡</div>
+                  <p style={{ margin: '0 0 0.5rem 0', fontWeight: 600, color: '#64748b' }}>AI 분석 결과가 아직 존재하지 않습니다.</p>
+                  <p style={{ margin: 0, fontSize: '0.85rem' }}>왼쪽 양식에 민원 제목과 내용을 채운 후 분석을 요청해 보세요.</p>
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '1.2rem' }}>
+                  {aiRecommendations.map((rec, idx) => {
+                    const isFirst = idx === 0;
+                    return (
+                      <div 
+                        key={idx} 
+                        onClick={() => setSelectedDept(rec.department)}
+                        style={{
+                          border: isFirst ? '2px solid #6366f1' : '1px solid #e2e8f0',
+                          backgroundColor: isFirst ? '#f8fafc' : '#ffffff',
+                          padding: '1.2rem',
+                          borderRadius: '12px',
+                          cursor: 'pointer',
+                          position: 'relative',
+                          boxShadow: isFirst ? '0 4px 12px rgba(99, 102, 241, 0.08)' : '0 1px 3px rgba(0,0,0,0.01)',
+                          transition: 'all 0.2s ease',
+                        }}
+                        onMouseEnter={(e) => {
+                          e.currentTarget.style.transform = 'translateY(-2px)';
+                          e.currentTarget.style.boxShadow = '0 6px 16px rgba(0,0,0,0.06)';
+                        }}
+                        onMouseLeave={(e) => {
+                          e.currentTarget.style.transform = 'translateY(0)';
+                          e.currentTarget.style.boxShadow = isFirst ? '0 4px 12px rgba(99, 102, 241, 0.08)' : '0 1px 3px rgba(0,0,0,0.01)';
+                        }}
+                      >
+                        {/* 1순위 왕관 뱃지 */}
+                        {isFirst && (
+                          <span style={{
+                            position: 'absolute',
+                            top: '-12px',
+                            left: '12px',
+                            backgroundColor: '#6366f1',
+                            color: '#ffffff',
+                            padding: '0.15rem 0.5rem',
+                            borderRadius: '8px',
+                            fontSize: '0.75rem',
+                            fontWeight: 800,
+                            boxShadow: '0 2px 4px rgba(99,102,241,0.3)'
+                          }}>
+                            👑 AI 최적 추천
+                          </span>
+                        )}
+
+                        <div style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          marginBottom: '0.8rem',
+                          marginTop: isFirst ? '0.3rem' : '0'
+                        }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                            <span style={{
+                              fontSize: '1rem',
+                              fontWeight: 800,
+                              color: isFirst ? '#4f46e5' : '#64748b'
+                            }}>
+                              {rec.rank}순위.
+                            </span>
+                            <span style={{
+                              fontSize: '1.1rem',
+                              fontWeight: 800,
+                              color: '#1e293b'
+                            }}>
+                              {rec.department}
+                            </span>
+                          </div>
+                          
+                          {/* 신뢰도 점수 */}
+                          <span style={{
+                            backgroundColor: isFirst ? '#e0e7ff' : '#f1f5f9',
+                            color: isFirst ? '#4f46e5' : '#475569',
+                            padding: '0.25rem 0.6rem',
+                            borderRadius: '6px',
+                            fontSize: '0.8rem',
+                            fontWeight: 700,
+                            border: `1px solid ${isFirst ? '#c7d2fe' : '#e2e8f0'}`
+                          }}>
+                            신뢰도 {Math.round(rec.confidence * 100)}%
+                          </span>
+                        </div>
+
+                        {/* 매칭된 AI 추출 태그들 */}
+                        {rec.matchedKeywords && rec.matchedKeywords.length > 0 && (
+                          <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap', marginBottom: '0.8rem' }}>
+                            {rec.matchedKeywords.map((kw, kwIdx) => (
+                              <span key={kwIdx} style={{
+                                backgroundColor: isFirst ? '#e0f2fe' : '#f8fafc',
+                                color: isFirst ? '#0369a1' : '#64748b',
+                                padding: '0.2rem 0.5rem',
+                                borderRadius: '6px',
+                                fontSize: '0.75rem',
+                                fontWeight: 600,
+                                border: `1px solid ${isFirst ? '#bae6fd' : '#cbd5e1'}`
+                              }}>
+                                #{kw}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+
+                        <p style={{
+                          margin: 0,
+                          fontSize: '0.88rem',
+                          color: '#334155',
+                          lineHeight: '1.6',
+                          wordBreak: 'keep-all'
+                        }}>
+                          {rec.reason}
+                        </p>
+
+                        <div style={{
+                          marginTop: '0.8rem',
+                          fontSize: '0.78rem',
+                          color: isFirst ? '#6366f1' : '#94a3b8',
+                          fontWeight: 600,
+                          textAlign: 'right',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'flex-end',
+                          gap: '0.25rem'
+                        }}>
+                          <span>🖱️ 클릭 시 신청부서 자동 대입</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
             
             {/* 키워드 디스플레이 */}
             {keywords.length > 0 && (
